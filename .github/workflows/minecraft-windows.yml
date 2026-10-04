@@ -1,0 +1,1031 @@
+name: Minecraft Windows Server
+
+# Paper 1.18.1 on a temporary windows-latest runner, reachable only through Tailscale.
+# World persistence: GitHub Release assets (tag "mc-backup"), NOT Actions cache.
+# Required secrets : TAILSCALE_AUTHKEY, WINDOWS_PASSWORD
+# Optional secret  : BACKUP_PASSPHRASE   (encrypts backups - strongly recommended for PUBLIC repos)
+# Optional variable: MC_AUTOCHAIN=false  (stops the workflow from re-queueing itself)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_new_world:
+        description: "DANGEROUS: ignore the saved backup and generate a brand-new world"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "23 */6 * * *"
+
+permissions:
+  contents: write   # backups are stored as release assets
+  actions: write    # lets the run queue its own successor
+
+# Only ONE server at a time. A newer run waits (pending) instead of cancelling the running server.
+concurrency:
+  group: minecraft-windows-server
+  cancel-in-progress: false
+
+env:
+  MC_VERSION: "1.18.1"
+  MC_MAX_PLAYERS: "10"
+  MC_VIEW_DISTANCE: "8"
+  MC_SIM_DISTANCE: "6"
+  MC_ONLINE_MODE: "false"          # false = cracked/offline clients (e.g. MihanCraft) can join. Applied only when server.properties is first created.
+  MC_PORT: "25565"
+  MC_RCON_PORT: "25575"
+  MC_STOP_AFTER_MIN: "335"         # minutes after job start when shutdown + backup begins (job hard limit is 360)
+  MC_BACKUP_INTERVAL_MIN: "60"     # live backup interval while the server runs
+  MC_BACKUP_KEEP: "3"              # complete backup sets kept in the release
+  MC_BACKUP_TAG: "mc-backup"
+  MC_DIR: 'C:\mc\server'
+  MC_LIB: 'C:\mc\lib\mc-lib.ps1'
+  TS_HOSTNAME: "cynet-windows"
+  SSH_USER: "cynetadmin"
+
+jobs:
+  minecraft:
+    name: Minecraft server (Paper 1.18.1)
+    runs-on: windows-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FORCE_NEW_WORLD: ${{ inputs.force_new_world && 'true' || 'false' }}
+
+    steps:
+      - name: "1. Init - checks, job clock, folders"
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          WINDOWS_PASSWORD: ${{ secrets.WINDOWS_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) { $missing += 'TAILSCALE_AUTHKEY' }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_PASSWORD)) { $missing += 'WINDOWS_PASSWORD' }
+          if ($missing.Count -gt 0) {
+            Write-Host "::error title=Missing secrets::Create these repository secrets first: $($missing -join ', ') (Settings > Secrets and variables > Actions > New repository secret)."
+            exit 1
+          }
+          $start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          Add-Content -Path $env:GITHUB_ENV -Value "JOB_START_EPOCH=$start" -Encoding utf8
+          New-Item -ItemType Directory -Force 'C:\mc', 'C:\mc\lib', 'C:\mc\server', 'C:\mc\work' | Out-Null
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "Runner OS : $($os.Caption) $($os.Version)"
+          Write-Host "Runner    : $($env:RUNNER_NAME) / $($env:RUNNER_ARCH)"
+          Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+          Write-Host "Job start : $([DateTimeOffset]::FromUnixTimeSeconds($start).ToString('u')) - server stops after $($env:MC_STOP_AFTER_MIN) min"
+          $global:LASTEXITCODE = 0
+
+      - name: "2. Write helper library"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lib = @'
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          if (-not $env:MC_DIR)         { $env:MC_DIR = 'C:\mc\server' }
+          if (-not $env:MC_RCON_PORT)   { $env:MC_RCON_PORT = '25575' }
+          if (-not $env:MC_PORT)        { $env:MC_PORT = '25565' }
+          if (-not $env:MC_BACKUP_TAG)  { $env:MC_BACKUP_TAG = 'mc-backup' }
+          if (-not $env:MC_BACKUP_KEEP) { $env:MC_BACKUP_KEEP = '3' }
+          $script:McRoot   = 'C:\mc'
+          $script:StageDir = 'C:\mc\stage'
+          $script:WorkDir  = 'C:\mc\work'
+          if (-not $env:MC_RCON_PASSWORD -and (Test-Path 'C:\mc\rcon.secret')) {
+            $env:MC_RCON_PASSWORD = (Get-Content 'C:\mc\rcon.secret' -Raw).Trim()
+          }
+
+          function Write-Info { param([string]$Message) Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $Message) }
+          function Write-Warn { param([string]$Message) Write-Host "::warning::$Message" }
+
+          # ---------- server.properties helpers ----------
+          function Get-Prop {
+            param([string]$Path, [string]$Key)
+            if (-not (Test-Path -LiteralPath $Path)) { return $null }
+            foreach ($l in (Get-Content -LiteralPath $Path)) {
+              if ($l -match ('^\s*' + [regex]::Escape($Key) + '\s*=\s*(.*)$')) { return $Matches[1].Trim() }
+            }
+            return $null
+          }
+
+          function Set-Prop {
+            param([string]$Path, [string]$Key, [string]$Value)
+            $lines = @()
+            if (Test-Path -LiteralPath $Path) { $lines = @(Get-Content -LiteralPath $Path) }
+            $found = $false
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match ('^\s*' + [regex]::Escape($Key) + '\s*=')) { $lines[$i] = "$Key=$Value"; $found = $true }
+            }
+            if (-not $found) { $lines += "$Key=$Value" }
+            Set-Content -LiteralPath $Path -Value $lines -Encoding ascii
+          }
+
+          # ---------- tools ----------
+          function Get-SevenZip {
+            $cmd = Get-Command 7z.exe -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            foreach ($p in @('C:\Program Files\7-Zip\7z.exe', 'C:\Program Files (x86)\7-Zip\7z.exe')) {
+              if (Test-Path $p) { return $p }
+            }
+            Write-Info 'Installing 7-Zip via Chocolatey...'
+            choco install 7zip -y --no-progress | Out-Host
+            if (Test-Path 'C:\Program Files\7-Zip\7z.exe') { return 'C:\Program Files\7-Zip\7z.exe' }
+            throw '7-Zip was not found and could not be installed.'
+          }
+
+          # ---------- RCON (used for save / stop / commands) ----------
+          function Read-Exact {
+            param([System.IO.Stream]$Stream, [int]$Count)
+            $buf = New-Object byte[] $Count
+            $off = 0
+            while ($off -lt $Count) {
+              $n = $Stream.Read($buf, $off, $Count - $off)
+              if ($n -le 0) { throw 'RCON connection closed.' }
+              $off += $n
+            }
+            return ,$buf
+          }
+
+          function Send-RconPacket {
+            param([System.IO.Stream]$Stream, [int]$Id, [int]$Type, [string]$Body)
+            $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+            $ms = New-Object System.IO.MemoryStream
+            $bw = New-Object System.IO.BinaryWriter($ms)
+            $bw.Write([int]($bodyBytes.Length + 10))
+            $bw.Write([int]$Id)
+            $bw.Write([int]$Type)
+            $bw.Write($bodyBytes)
+            $bw.Write([byte]0)
+            $bw.Write([byte]0)
+            $bw.Flush()
+            $bytes = $ms.ToArray()
+            $Stream.Write($bytes, 0, $bytes.Length)
+            $Stream.Flush()
+          }
+
+          function Read-RconPacket {
+            param([System.IO.Stream]$Stream)
+            $lenBytes = Read-Exact $Stream 4
+            $len = [BitConverter]::ToInt32($lenBytes, 0)
+            if ($len -lt 10 -or $len -gt 8192) { throw "Invalid RCON packet length $len" }
+            $payload = Read-Exact $Stream $len
+            $id = [BitConverter]::ToInt32($payload, 0)
+            $type = [BitConverter]::ToInt32($payload, 4)
+            $body = ''
+            if ($len -gt 10) { $body = [System.Text.Encoding]::UTF8.GetString($payload, 8, $len - 10) }
+            return [pscustomobject]@{ Id = $id; Type = $type; Body = $body }
+          }
+
+          function Invoke-Rcon {
+            param([Parameter(Mandatory)][string]$Command, [int]$TimeoutSec = 30)
+            if (-not $env:MC_RCON_PASSWORD) { throw 'RCON password is not available.' }
+            $client = New-Object System.Net.Sockets.TcpClient
+            try {
+              $client.ReceiveTimeout = $TimeoutSec * 1000
+              $client.SendTimeout = $TimeoutSec * 1000
+              $client.Connect('127.0.0.1', [int]$env:MC_RCON_PORT)
+              $stream = $client.GetStream()
+              Send-RconPacket $stream 1 3 $env:MC_RCON_PASSWORD
+              $auth = Read-RconPacket $stream
+              if ($auth.Type -eq 0) { $auth = Read-RconPacket $stream }
+              if ($auth.Id -eq -1) { throw 'RCON authentication failed.' }
+              Send-RconPacket $stream 2 2 $Command
+              $resp = Read-RconPacket $stream
+              return $resp.Body
+            } finally {
+              $client.Close()
+            }
+          }
+
+          # ---------- Minecraft process control ----------
+          function Get-McProcess {
+            $pf = Join-Path $script:McRoot 'server.pid'
+            if (-not (Test-Path $pf)) { return $null }
+            $mcPid = [int]((Get-Content $pf -Raw).Trim())
+            $p = Get-Process -Id $mcPid -ErrorAction SilentlyContinue
+            if ($p -and -not $p.HasExited) { return $p }
+            return $null
+          }
+
+          function Get-McLogTail {
+            $out = @()
+            foreach ($f in @((Join-Path $env:MC_DIR 'logs\latest.log'), 'C:\mc\stderr.log', 'C:\mc\stdout.log')) {
+              if (Test-Path -LiteralPath $f) {
+                $out += "--- tail of $f ---"
+                $out += @(Get-Content -LiteralPath $f -Tail 40)
+              }
+            }
+            return ($out -join "`n")
+          }
+
+          function Start-McServer {
+            $javaExe = $env:MC_JAVA
+            if (-not $javaExe -or -not (Test-Path $javaExe)) { throw 'MC_JAVA is not set - did the resource detection step run?' }
+            $jvmFile = Join-Path $script:McRoot 'jvm-args.txt'
+            if (-not (Test-Path $jvmFile)) { throw 'jvm-args.txt is missing.' }
+            $jvmArgs = @(Get-Content $jvmFile | Where-Object { $_.Trim() })
+            $argList = $jvmArgs + @('-jar', 'paper.jar', '--nogui')
+            $logs = Join-Path $env:MC_DIR 'logs'
+            New-Item -ItemType Directory -Force $logs | Out-Null
+            $latest = Join-Path $logs 'latest.log'
+            if (Test-Path $latest) {
+              Move-Item -LiteralPath $latest -Destination (Join-Path $logs ("prev-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) -Force
+            }
+            $stdin = Join-Path $script:McRoot 'empty-stdin.txt'
+            if (-not (Test-Path $stdin)) { New-Item -ItemType File $stdin | Out-Null }
+            Write-Info "Starting Minecraft: java $($jvmArgs -join ' ') -jar paper.jar --nogui"
+            $p = Start-Process -FilePath $javaExe -ArgumentList $argList -WorkingDirectory $env:MC_DIR -NoNewWindow -PassThru `
+              -RedirectStandardOutput (Join-Path $script:McRoot 'stdout.log') `
+              -RedirectStandardError (Join-Path $script:McRoot 'stderr.log') `
+              -RedirectStandardInput $stdin
+            Set-Content -Path (Join-Path $script:McRoot 'server.pid') -Value $p.Id
+            Write-Info "Minecraft started (PID $($p.Id))."
+          }
+
+          function Wait-McReady {
+            param([int]$TimeoutSec = 900)
+            $limit = (Get-Date).AddSeconds($TimeoutSec)
+            while ((Get-Date) -lt $limit) {
+              if (-not (Get-McProcess)) { throw "Minecraft process exited during startup.`n$(Get-McLogTail)" }
+              try {
+                $r = Invoke-Rcon 'list' -TimeoutSec 5
+                Write-Info "Server is ready: $r"
+                return
+              } catch {
+                Start-Sleep -Seconds 5
+              }
+            }
+            throw "Server did not become ready within $TimeoutSec seconds.`n$(Get-McLogTail)"
+          }
+
+          function Stop-McServer {
+            param([int]$WaitSec = 240)
+            $p = Get-McProcess
+            if (-not $p) { Write-Info 'Minecraft is not running - nothing to stop.'; return }
+            try {
+              Write-Info 'Graceful shutdown: save-all flush'
+              [void](Invoke-Rcon 'save-all flush' -TimeoutSec 180)
+            } catch { Write-Warn "save-all flush failed: $($_.Exception.Message)" }
+            try {
+              Write-Info 'Graceful shutdown: stop'
+              [void](Invoke-Rcon 'stop' -TimeoutSec 10)
+            } catch { Write-Info "RCON stop ended with: $($_.Exception.Message) (normal when the server closes the connection)" }
+            if (-not $p.WaitForExit($WaitSec * 1000)) {
+              Write-Warn "Minecraft did not exit within $WaitSec s - killing the process."
+              Stop-Process -Id $p.Id -Force
+              Start-Sleep -Seconds 3
+            }
+            Start-Sleep -Seconds 3
+            Write-Info 'Minecraft stopped; world files are flushed.'
+          }
+
+          function Read-McLogDelta {
+            param([string]$Path, [ref]$Position)
+            if (-not (Test-Path -LiteralPath $Path)) { return }
+            $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+            try {
+              if ($Position.Value -gt $fs.Length) { $Position.Value = 0 }
+              [void]$fs.Seek($Position.Value, 'Begin')
+              $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+              $text = $sr.ReadToEnd()
+              $Position.Value = $fs.Position
+              if ($text) { Write-Host ($text.TrimEnd()) }
+            } finally {
+              $fs.Dispose()
+            }
+          }
+
+          # ---------- Paper download ----------
+          function Get-PaperJar {
+            param([string]$Version, [string]$Target)
+            $headers = @{ 'User-Agent' = "github-actions-minecraft ($($env:GITHUB_REPOSITORY))" }
+            $url = $null; $sha = $null; $build = $null
+            try {
+              $b = Invoke-RestMethod -Uri "https://api.papermc.io/v2/projects/paper/versions/$Version/builds" -Headers $headers -TimeoutSec 60
+              $last = $b.builds | Sort-Object build | Select-Object -Last 1
+              $build = [string]$last.build
+              $name = $last.downloads.application.name
+              $sha = $last.downloads.application.sha256
+              $url = "https://api.papermc.io/v2/projects/paper/versions/$Version/builds/$build/downloads/$name"
+            } catch {
+              Write-Warn "Paper API v2 lookup failed: $($_.Exception.Message) - trying the v3 API."
+            }
+            if (-not $url) {
+              try {
+                $b = Invoke-RestMethod -Uri "https://fill.papermc.io/v3/projects/paper/versions/$Version/builds" -Headers $headers -TimeoutSec 60
+                $last = @($b) | Sort-Object id | Select-Object -Last 1
+                $dl = $last.downloads.'server:default'
+                $build = [string]$last.id
+                $url = $dl.url
+                $sha = $dl.checksums.sha256
+              } catch {
+                throw "Could not resolve a Paper $Version download from either Paper API: $($_.Exception.Message)"
+              }
+            }
+            if (-not $url) { throw "No Paper download URL found for $Version." }
+            Write-Info "Downloading Paper $Version build $build"
+            $tmp = "$Target.download"
+            Invoke-WebRequest -Uri $url -OutFile $tmp -Headers $headers -TimeoutSec 600
+            if ($sha) {
+              $actual = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+              if ($actual -ne $sha.ToUpperInvariant() -and $actual -ne $sha) {
+                Remove-Item -LiteralPath $tmp -Force
+                throw "Paper jar SHA-256 mismatch (expected $sha, got $actual)."
+              }
+              Write-Info 'Paper jar SHA-256 verified.'
+            }
+            Move-Item -LiteralPath $tmp -Destination $Target -Force
+            return $build
+          }
+
+          # ---------- backup storage (GitHub release assets) ----------
+          function Initialize-BackupRelease {
+            & gh release view $env:MC_BACKUP_TAG --repo $env:GITHUB_REPOSITORY *> $null
+            if ($LASTEXITCODE -eq 0) { return }
+            Write-Info 'Creating the backup release (first backup)...'
+            $o = & gh release create $env:MC_BACKUP_TAG --repo $env:GITHUB_REPOSITORY --title 'Minecraft world backups' --notes 'Automated Minecraft world backups. Do not edit manually.' --prerelease 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "Could not create the backup release: $o" }
+          }
+
+          function Get-BackupAssets {
+            $o = & gh api "repos/$($env:GITHUB_REPOSITORY)/releases/tags/$($env:MC_BACKUP_TAG)" --jq '.id' 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              if (("$o") -match 'Not Found|404') { return @() }
+              throw "Could not query the backup release: $o"
+            }
+            $rid = ("$o").Trim()
+            $lines = & gh api "repos/$($env:GITHUB_REPOSITORY)/releases/$rid/assets?per_page=100" --paginate --jq '.[] | [.id, .name, .state, .size] | @tsv' 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "Could not list backup assets: $lines" }
+            $assets = @()
+            foreach ($l in @($lines)) {
+              $s = "$l"
+              if (-not $s.Trim()) { continue }
+              $f = $s -split "`t"
+              if ($f.Count -lt 4) { continue }
+              $assets += [pscustomobject]@{ Id = $f[0]; Name = $f[1]; State = $f[2]; Size = [int64]$f[3] }
+            }
+            return $assets
+          }
+
+          function Get-CompleteBackupPrefixes {
+            param($Assets)
+            $names = @($Assets | Where-Object { $_.State -eq 'uploaded' -and $_.Name -like 'world-*.ok' } |
+              ForEach-Object { $_.Name.Substring(0, $_.Name.Length - 3) })
+            return @($names | Sort-Object -Descending)
+          }
+
+          function Publish-Asset {
+            param([string]$Path)
+            for ($try = 1; $try -le 4; $try++) {
+              $o = & gh release upload $env:MC_BACKUP_TAG $Path --repo $env:GITHUB_REPOSITORY --clobber 2>&1
+              if ($LASTEXITCODE -eq 0) { return }
+              Write-Warn "Upload attempt $try for $(Split-Path $Path -Leaf) failed: $o"
+              Start-Sleep -Seconds (10 * $try)
+            }
+            throw "Failed to upload $Path after 4 attempts."
+          }
+
+          function Remove-OldBackups {
+            $keep = [int]$env:MC_BACKUP_KEEP
+            if ($keep -lt 2) { $keep = 2 }
+            $assets = @(Get-BackupAssets)
+            $complete = @(Get-CompleteBackupPrefixes $assets)
+            if ($complete.Count -eq 0) { return }
+            $newest = $complete[0]
+            $keepSet = @($complete | Select-Object -First $keep)
+            foreach ($a in $assets) {
+              if ($a.Name -notlike 'world-*') { continue }
+              $pfx = $a.Name.Split('.')[0]
+              if ($keepSet -contains $pfx) { continue }
+              if ([string]::CompareOrdinal($pfx, $newest) -gt 0) { continue }
+              $o = & gh api -X DELETE "repos/$($env:GITHUB_REPOSITORY)/releases/assets/$($a.Id)" 2>&1
+              if ($LASTEXITCODE -ne 0) { Write-Warn "Could not delete old asset $($a.Name): $o" }
+            }
+            Write-Info "Backup retention applied (keeping $($keepSet.Count) complete set(s))."
+          }
+
+          function Copy-McData {
+            param([string]$Source, [string]$Dest)
+            $level = Get-Prop (Join-Path $Source 'server.properties') 'level-name'
+            if (-not $level) { $level = 'world' }
+            $dirs = @($level, "${level}_nether", "${level}_the_end", 'plugins', 'config')
+            $files = @('server.properties', 'ops.json', 'whitelist.json', 'banned-players.json', 'banned-ips.json', 'eula.txt',
+                       'usercache.json', 'paper.jar', 'paper-build.txt', 'paper.yml', 'spigot.yml', 'bukkit.yml',
+                       'commands.yml', 'permissions.yml', 'help.yml')
+            foreach ($d in $dirs) {
+              $src = Join-Path $Source $d
+              if (Test-Path -LiteralPath $src -PathType Container) {
+                $dst = Join-Path $Dest $d
+                $null = robocopy $src $dst /E /R:2 /W:2 /NFL /NDL /NJH /NJS /NP /MT:8 /XF session.lock
+                if ($LASTEXITCODE -ge 8) { throw "robocopy failed for '$d' (exit code $LASTEXITCODE)." }
+              }
+            }
+            foreach ($f in $files) {
+              $src = Join-Path $Source $f
+              if (Test-Path -LiteralPath $src -PathType Leaf) { Copy-Item -LiteralPath $src -Destination (Join-Path $Dest $f) -Force }
+            }
+            $global:LASTEXITCODE = 0
+          }
+
+          function New-McBackup {
+            param([Parameter(Mandatory)][ValidateSet('live', 'stopped')][string]$Mode)
+            $sevenZip = Get-SevenZip
+            $stage = $script:StageDir
+            $work = $script:WorkDir
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -LiteralPath $work -Filter 'world-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force $stage, $work | Out-Null
+
+            $saveOff = $false
+            try {
+              if ($Mode -eq 'live') {
+                Write-Info 'Live backup: save-off + save-all flush'
+                $saveOff = $true
+                [void](Invoke-Rcon 'save-off' -TimeoutSec 30)
+                [void](Invoke-Rcon 'save-all flush' -TimeoutSec 300)
+              }
+              Write-Info 'Copying world and config files to the staging folder...'
+              Copy-McData -Source $env:MC_DIR -Dest $stage
+            } finally {
+              if ($saveOff) {
+                try { [void](Invoke-Rcon 'save-on' -TimeoutSec 30) } catch { Write-Warn "save-on failed: $($_.Exception.Message)" }
+              }
+            }
+
+            # never persist the per-run RCON password
+            $sp = Join-Path $stage 'server.properties'
+            if (Test-Path $sp) { Set-Prop $sp 'rcon.password' ''; Set-Prop $sp 'enable-rcon' 'false' }
+
+            $ts = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')
+            $prefix = "world-$ts"
+            $archive = Join-Path $work "$prefix.zip"
+            $encArgs = @()
+            if ($env:BACKUP_PASSPHRASE) { $encArgs = @("-p$($env:BACKUP_PASSPHRASE)", '-mem=AES256') }
+            Write-Info "Compressing backup $prefix ..."
+            $z = & $sevenZip a -tzip -mx=1 -mmt=on '-v1900m' @encArgs $archive "$stage\*" 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "7-Zip failed (exit $LASTEXITCODE): $((@($z) | Select-Object -Last 15) -join "`n")" }
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+
+            $parts = @(Get-ChildItem -LiteralPath $work -Filter "$prefix.zip.*" | Sort-Object Name)
+            if ($parts.Count -eq 0) { throw 'No archive parts were produced.' }
+            $totalMB = [math]::Round((($parts | Measure-Object Length -Sum).Sum) / 1MB, 1)
+            Write-Info "Archive: $($parts.Count) part(s), $totalMB MB. Uploading..."
+
+            Initialize-BackupRelease
+            foreach ($p in $parts) { Publish-Asset $p.FullName }
+            $manifest = Join-Path $work "$prefix.ok"
+            Set-Content -LiteralPath $manifest -Value ($parts | ForEach-Object { "$($_.Name)|$($_.Length)" }) -Encoding ascii
+            Publish-Asset $manifest      # the .ok file is uploaded LAST: only sets that have it are restorable
+            Write-Info "Backup $prefix uploaded and committed."
+            Remove-OldBackups
+            Get-ChildItem -LiteralPath $work -Filter 'world-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            $global:LASTEXITCODE = 0
+          }
+
+          function Restore-McBackup {
+            $assets = @(Get-BackupAssets)
+            $prefixes = @(Get-CompleteBackupPrefixes $assets)
+            if ($prefixes.Count -eq 0) {
+              Write-Info 'No previous backup found - a new world will be generated.'
+              return $false
+            }
+            $prefix = $prefixes[0]
+            Write-Info "Restoring backup set $prefix ..."
+            $sevenZip = Get-SevenZip
+            $dl = Join-Path $script:WorkDir 'restore'
+            Remove-Item -LiteralPath $dl -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force $dl | Out-Null
+            $o = & gh release download $env:MC_BACKUP_TAG --repo $env:GITHUB_REPOSITORY --pattern "$prefix.*" --dir $dl --clobber 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "gh release download failed: $o" }
+            $manifestPath = Join-Path $dl "$prefix.ok"
+            if (-not (Test-Path -LiteralPath $manifestPath)) { throw "Manifest $prefix.ok is missing." }
+            $first = $null
+            foreach ($line in (Get-Content -LiteralPath $manifestPath)) {
+              if (-not $line.Trim()) { continue }
+              $name, $size = $line.Split('|')
+              $f = Join-Path $dl $name
+              if (-not (Test-Path -LiteralPath $f)) { throw "Backup part missing: $name" }
+              if ((Get-Item -LiteralPath $f).Length -ne [int64]$size) { throw "Backup part has the wrong size: $name" }
+              if (-not $first) { $first = $f }
+            }
+            if (-not $first) { throw 'Manifest is empty.' }
+            New-Item -ItemType Directory -Force $env:MC_DIR | Out-Null
+            $pw = 'no-passphrase-configured'
+            if ($env:BACKUP_PASSPHRASE) { $pw = $env:BACKUP_PASSPHRASE }
+            $x = & $sevenZip x $first "-o$($env:MC_DIR)" -y "-p$pw" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw "7-Zip extraction failed (exit $LASTEXITCODE). If the backup is encrypted, check the BACKUP_PASSPHRASE secret. $((@($x) | Select-Object -Last 10) -join "`n")"
+            }
+            Remove-Item -LiteralPath $dl -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not ((Test-Path (Join-Path $env:MC_DIR 'server.properties')) -or (Test-Path (Join-Path $env:MC_DIR 'world')))) {
+              throw 'Restore finished but no world or server.properties was found.'
+            }
+            Write-Info 'Restore finished.'
+            return $true
+          }
+          '@
+          Set-Content -Path 'C:\mc\lib\mc-lib.ps1' -Value $lib -Encoding utf8
+
+          # convenience wrapper for SSH sessions:  pwsh C:\mc\mc-cmd.ps1 "op Steve"
+          $wrapper = @(
+            'param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Command)',
+            ". 'C:\mc\lib\mc-lib.ps1'",
+            'Invoke-Rcon ($Command -join " ")'
+          )
+          Set-Content -Path 'C:\mc\mc-cmd.ps1' -Value $wrapper -Encoding utf8
+          [void][System.Management.Automation.Language.Parser]::ParseFile('C:\mc\lib\mc-lib.ps1', [ref]$null, [ref]$null)
+          Write-Host 'Helper library written.'
+          $global:LASTEXITCODE = 0
+
+      - name: "3. Install Java 17 (Temurin)"
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: "4. Tailscale - install, connect, firewall"
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . $env:MC_LIB
+          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (-not (Test-Path $ts)) {
+            $msi = Join-Path $env:RUNNER_TEMP 'tailscale.msi'
+            $urls = @('https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi')
+            try {
+              $meta = Invoke-RestMethod -Uri 'https://pkgs.tailscale.com/stable/?mode=json' -TimeoutSec 30
+              if ($meta.MSIs.x64) { $urls += "https://pkgs.tailscale.com/stable/$($meta.MSIs.x64)" }
+            } catch { Write-Warn "Could not read the Tailscale package index: $($_.Exception.Message)" }
+            $downloaded = $false
+            foreach ($u in $urls) {
+              try { Invoke-WebRequest -Uri $u -OutFile $msi -TimeoutSec 300; $downloaded = $true; break }
+              catch { Write-Warn "Tailscale download failed from $u" }
+            }
+            if (-not $downloaded) { throw 'Could not download the Tailscale MSI installer.' }
+            Write-Info 'Installing Tailscale...'
+            $p = Start-Process -FilePath msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart') -Wait -PassThru
+            if (@(0, 3010) -notcontains $p.ExitCode) { throw "Tailscale MSI install failed (exit code $($p.ExitCode))." }
+          }
+          $svc = Get-Service -Name 'Tailscale' -ErrorAction SilentlyContinue
+          if (-not $svc) { throw 'The Tailscale service was not found after installation.' }
+          if ($svc.Status -ne 'Running') { Start-Service -Name 'Tailscale' }
+          Start-Sleep -Seconds 3
+
+          Write-Info "Connecting to Tailscale as '$($env:TS_HOSTNAME)' ..."
+          $upOut = & $ts up "--auth-key=$($env:TS_AUTHKEY)" "--hostname=$($env:TS_HOSTNAME)" --unattended --accept-dns=false --accept-routes=false --reset --timeout=120s 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "tailscale up failed (exit $LASTEXITCODE): $(@($upOut) -join ' ') -- Check that TAILSCALE_AUTHKEY is valid, not expired, and reusable."
+          }
+
+          $ip = $null; $j = $null
+          $limit = (Get-Date).AddSeconds(90)
+          while ((Get-Date) -lt $limit) {
+            $j = & $ts status --json 2>$null | ConvertFrom-Json
+            if ($j -and $j.BackendState -eq 'Running') {
+              $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+              if ($ip) { break }
+            }
+            Start-Sleep -Seconds 3
+          }
+          if (-not $ip) { throw 'Tailscale did not reach the Running state with an IPv4 address within 90 seconds.' }
+          $dns = ([string]$j.Self.DNSName).TrimEnd('.')
+          $host_ = [string]$j.Self.HostName
+          if ($host_ -ne $env:TS_HOSTNAME) { Write-Warn "Tailscale registered the name '$host_' instead of '$($env:TS_HOSTNAME)' (an old device with the same name still exists - delete it in the admin console or use an ephemeral auth key)." }
+          Add-Content -Path $env:GITHUB_ENV -Value "TS_IP=$ip" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "TS_DNS=$dns" -Encoding utf8
+
+          # Firewall: only the tailnet address range may reach SSH and Minecraft. RCON is blocked for the tailnet.
+          $range = @('100.64.0.0/10', 'fd7a:115c:a1e0::/48')
+          foreach ($n in 'MC-Minecraft-Tailscale', 'MC-SSH-Tailscale', 'MC-RCON-Block') {
+            Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          }
+          New-NetFirewallRule -DisplayName 'MC-Minecraft-Tailscale' -Direction Inbound -Action Allow -Protocol TCP -LocalPort ([int]$env:MC_PORT) -RemoteAddress $range -Profile Any | Out-Null
+          New-NetFirewallRule -DisplayName 'MC-SSH-Tailscale' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22 -RemoteAddress $range -Profile Any | Out-Null
+          New-NetFirewallRule -DisplayName 'MC-RCON-Block' -Direction Inbound -Action Block -Protocol TCP -LocalPort ([int]$env:MC_RCON_PORT) -RemoteAddress $range -Profile Any | Out-Null
+
+          Write-Host '=================== TAILSCALE ==================='
+          Write-Host "Hostname    : $host_"
+          Write-Host "MagicDNS    : $dns"
+          Write-Host "Tailscale IP: $ip"
+          Write-Host "Minecraft   : ${ip}:$($env:MC_PORT)   (or ${dns}:$($env:MC_PORT))"
+          Write-Host '================================================='
+          $global:LASTEXITCODE = 0
+
+      - name: "5. OpenSSH Server + admin user"
+        env:
+          WINDOWS_PASSWORD: ${{ secrets.WINDOWS_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . $env:MC_LIB
+          $user = $env:SSH_USER
+
+          # --- local administrator (password comes from the secret, never from YAML) ---
+          try {
+            $secure = ConvertTo-SecureString -String $env:WINDOWS_PASSWORD -AsPlainText -Force
+            $existing = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+            if ($existing) {
+              Set-LocalUser -Name $user -Password $secure
+              Enable-LocalUser -Name $user
+            } else {
+              New-LocalUser -Name $user -Password $secure -FullName 'Minecraft admin' -Description 'Created by the Minecraft workflow' -PasswordNeverExpires -AccountNeverExpires | Out-Null
+            }
+          } catch {
+            throw "Could not create or update the local user '$user'. Most likely WINDOWS_PASSWORD does not satisfy the Windows password policy (use 14+ characters with upper/lower case, digits and symbols). Details: $($_.Exception.Message)"
+          }
+          $isAdmin = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*\$user" }).Count -gt 0
+          if (-not $isAdmin) { Add-LocalGroupMember -Group 'Administrators' -Member $user }
+
+          # --- OpenSSH server ---
+          $svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
+          if (-not $svc) {
+            try {
+              Write-Info 'Installing the OpenSSH.Server Windows capability...'
+              Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
+            } catch {
+              Write-Warn "Add-WindowsCapability failed: $($_.Exception.Message)"
+            }
+            $svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
+          }
+          if (-not $svc) {
+            Write-Info 'Falling back to the Win32-OpenSSH release zip...'
+            $zip = Join-Path $env:RUNNER_TEMP 'OpenSSH-Win64.zip'
+            Invoke-WebRequest -Uri 'https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip' -OutFile $zip -TimeoutSec 300
+            Expand-Archive -LiteralPath $zip -DestinationPath 'C:\Program Files' -Force
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\Program Files\OpenSSH-Win64\install-sshd.ps1' | Out-Host
+            $svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
+          }
+          if (-not $svc) { throw 'sshd could not be installed (capability and zip fallback both failed).' }
+
+          Set-Service -Name sshd -StartupType Automatic
+          if ($svc.Status -ne 'Running') { Start-Service -Name sshd }
+
+          # default shell = PowerShell 7 for SSH sessions
+          $pwsh = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
+          if ($pwsh) {
+            New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
+            New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value $pwsh -PropertyType String -Force | Out-Null
+          }
+          Restart-Service -Name sshd
+
+          # the stock rule allows port 22 from anywhere - replace it with the tailnet-only rule created earlier
+          Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue | Disable-NetFirewallRule
+          $st = (Get-Service sshd).Status
+          if ($st -ne 'Running') { throw "sshd is not running (status: $st)." }
+
+          Write-Host '=================== SSH ==================='
+          Write-Host "User    : $user   (password = secret WINDOWS_PASSWORD, not printed)"
+          Write-Host "Command : ssh $user@$($env:TS_IP)"
+          Write-Host "Or      : ssh $user@$($env:TS_DNS)"
+          Write-Host "Console : pwsh C:\mc\mc-cmd.ps1 `"list`"   (runs a Minecraft console command via RCON)"
+          Write-Host '==========================================='
+          $global:LASTEXITCODE = 0
+
+      - name: "6. Detect resources and build JVM flags"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . $env:MC_LIB
+          $cs = Get-CimInstance Win32_ComputerSystem
+          $os = Get-CimInstance Win32_OperatingSystem
+          $totalMB = [int][math]::Floor($cs.TotalPhysicalMemory / 1MB)
+          $freeMB = [int][math]::Floor($os.FreePhysicalMemory / 1024)
+          $cpu = [Environment]::ProcessorCount
+          if ($cpu -lt 1) { $cpu = 1 }
+
+          # heap = min(72% of total RAM, free RAM - 2.5 GB), capped at 16 GB, floor 2 GB
+          $byTotal = [int][math]::Floor($totalMB * 0.72)
+          $byFree = $freeMB - 2560
+          $heap = [math]::Min($byTotal, $byFree)
+          $heap = [math]::Min($heap, 16384)
+          if ($heap -lt 2048) {
+            if ($totalMB -ge 4096 -and $freeMB -ge 3584) {
+              Write-Warn "Runner is small (total $totalMB MB, free $freeMB MB): using the 2048 MB minimum heap. Expect lag with many farms."
+              $heap = 2048
+            } else {
+              throw "Not enough RAM for a safe Minecraft server (total $totalMB MB, free $freeMB MB)."
+            }
+          }
+          $heap = [int]([math]::Floor($heap / 256) * 256)
+
+          $par = [math]::Min($cpu, [math]::Max(2, $cpu - 1))
+          $conc = [math]::Max(1, [int][math]::Floor($par / 4))
+          if ($heap -ge 12288) { $newMin = 40; $newMax = 50; $region = '16M'; $reserve = 15; $ihop = 20 }
+          else                 { $newMin = 30; $newMax = 40; $region = '8M';  $reserve = 20; $ihop = 15 }
+
+          $jvm = @(
+            "-Xms${heap}M", "-Xmx${heap}M",
+            '-XX:+UseG1GC', '-XX:+ParallelRefProcEnabled', '-XX:MaxGCPauseMillis=200', '-XX:+UnlockExperimentalVMOptions',
+            '-XX:+DisableExplicitGC', '-XX:+AlwaysPreTouch',
+            "-XX:G1NewSizePercent=$newMin", "-XX:G1MaxNewSizePercent=$newMax", "-XX:G1HeapRegionSize=$region",
+            "-XX:G1ReservePercent=$reserve", '-XX:G1HeapWastePercent=5', '-XX:G1MixedGCCountTarget=4',
+            "-XX:InitiatingHeapOccupancyPercent=$ihop", '-XX:G1MixedGCLiveThresholdPercent=90',
+            '-XX:G1RSetUpdatingPauseTimePercent=5', '-XX:SurvivorRatio=32', '-XX:+PerfDisableSharedMem',
+            '-XX:MaxTenuringThreshold=1',
+            "-XX:ActiveProcessorCount=$cpu", "-XX:ParallelGCThreads=$par", "-XX:ConcGCThreads=$conc",
+            '-Dusing.aikars.flags=https://mcflags.emc.gs', '-Daikars.new.flags=true',
+            '-Dfile.encoding=UTF-8', '-Djava.net.preferIPv4Stack=true', '-Dcom.mojang.eula.agree=true',
+            '-Dterminal.jline=false', '-Dterminal.ansi=false'
+          )
+          Set-Content -Path 'C:\mc\jvm-args.txt' -Value $jvm -Encoding ascii
+
+          if (-not $env:JAVA_HOME) { throw 'JAVA_HOME is not set - setup-java did not run.' }
+          $javaExe = Join-Path $env:JAVA_HOME 'bin\java.exe'
+          if (-not (Test-Path $javaExe)) { throw "java.exe not found at $javaExe" }
+          $verOut = @(& $javaExe -version 2>&1 | ForEach-Object { "$_" })
+          $javaLine = $verOut | Select-Object -First 1
+          if ($javaLine -notmatch '"17\.') { throw "Minecraft 1.18.1 needs Java 17, but found: $javaLine" }
+          Add-Content -Path $env:GITHUB_ENV -Value "MC_JAVA=$javaExe" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "MC_HEAP_MB=$heap" -Encoding utf8
+
+          $gb = { param($mb) [math]::Round($mb / 1024, 1) }
+          Write-Host '=================== RESOURCES ==================='
+          Write-Host "Total RAM      : $(& $gb $totalMB) GB   (free now: $(& $gb $freeMB) GB)"
+          Write-Host "CPU Threads    : $cpu"
+          Write-Host "Minecraft RAM  : $(& $gb $heap) GB   (Xms = Xmx = $heap MB)"
+          Write-Host "GC threads     : parallel=$par concurrent=$conc"
+          Write-Host "Java Version   : $javaLine"
+          Write-Host "Server         : Paper $($env:MC_VERSION)"
+          Write-Host '================================================='
+          $global:LASTEXITCODE = 0
+
+      - name: "7. Prepare server - restore world, Paper jar, EULA, config"
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . $env:MC_LIB
+          $dir = $env:MC_DIR
+          New-Item -ItemType Directory -Force $dir, $script:WorkDir | Out-Null
+
+          # ---- restore ----
+          $restored = $false
+          if ($env:FORCE_NEW_WORLD -eq 'true') {
+            Write-Warn 'force_new_world=true: the saved backup is ignored; a brand-new world will be created.'
+          } else {
+            try {
+              $restored = [bool](@(Restore-McBackup)[-1])
+            } catch {
+              throw "Backup restore FAILED. Refusing to start a fresh world on top of existing data. Fix the cause or re-run with force_new_world=true. Details: $($_.Exception.Message)"
+            }
+          }
+
+          # ---- Paper jar (reuse the restored one; otherwise download + verify) ----
+          $jar = Join-Path $dir 'paper.jar'
+          $buildFile = Join-Path $dir 'paper-build.txt'
+          if (-not (Test-Path $jar)) {
+            $b = @(Get-PaperJar -Version $env:MC_VERSION -Target $jar)[-1]
+            Set-Content -Path $buildFile -Value $b -Encoding ascii
+          }
+          $build = 'unknown'
+          if (Test-Path $buildFile) { $build = (Get-Content $buildFile -Raw).Trim() }
+
+          # ---- EULA (accepting it is your responsibility: https://aka.ms/MinecraftEULA) ----
+          Set-Content -Path (Join-Path $dir 'eula.txt') -Value @('# Accepted by the repository owner: https://aka.ms/MinecraftEULA', 'eula=true') -Encoding ascii
+
+          # ---- RCON secret for this run ----
+          $bytes = New-Object byte[] 32
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+          $rcon = [Convert]::ToHexString($bytes).ToLowerInvariant()
+          Write-Host "::add-mask::$rcon"
+          Set-Content -Path 'C:\mc\rcon.secret' -Value $rcon -Encoding ascii
+          Add-Content -Path $env:GITHUB_ENV -Value "MC_RCON_PASSWORD=$rcon" -Encoding utf8
+
+          # ---- server.properties ----
+          $props = Join-Path $dir 'server.properties'
+          if (-not (Test-Path $props)) {
+            Write-Info 'First run: writing tuned server.properties'
+            $first = [ordered]@{
+              'motd' = 'Cynet Minecraft Server'
+              'gamemode' = 'survival'
+              'difficulty' = 'normal'
+              'pvp' = 'true'
+              'level-name' = 'world'
+              'online-mode' = $env:MC_ONLINE_MODE
+              'view-distance' = $env:MC_VIEW_DISTANCE
+              'simulation-distance' = $env:MC_SIM_DISTANCE
+              'sync-chunk-writes' = 'false'
+              'network-compression-threshold' = '256'
+              'enable-command-block' = 'true'
+            }
+            foreach ($k in $first.Keys) { Set-Prop $props $k ([string]$first[$k]) }
+          }
+          # values enforced on EVERY start
+          Set-Prop $props 'server-ip' ''
+          Set-Prop $props 'server-port' $env:MC_PORT
+          Set-Prop $props 'max-players' $env:MC_MAX_PLAYERS
+          Set-Prop $props 'enable-query' 'false'
+          Set-Prop $props 'enable-rcon' 'true'
+          Set-Prop $props 'rcon.port' $env:MC_RCON_PORT
+          Set-Prop $props 'rcon.password' $rcon
+          Set-Prop $props 'broadcast-rcon-to-ops' 'false'
+
+          # ---- tuned Paper/Spigot/Bukkit configs (written only if they do not exist yet) ----
+          $paperYml = @'
+          # Written by the workflow on first start. Edit freely - your edits are persisted.
+          world-settings:
+            default:
+              max-auto-save-chunks-per-tick: 8
+              optimize-explosions: true
+              prevent-moving-into-unloaded-chunks: true
+              per-player-mob-spawns: true
+              grass-spread-tick-rate: 4
+              hopper:
+                disable-move-event: true
+              entity-per-chunk-save-limit:
+                experience_orb: 16
+                snowball: 8
+                ender_pearl: 8
+                arrow: 16
+                fireball: 8
+                small_fireball: 8
+          '@
+          $spigotYml = @'
+          # Written by the workflow on first start. Edit freely - your edits are persisted.
+          settings:
+            restart-on-crash: false
+            timeout-time: 120
+          world-settings:
+            default:
+              mob-spawn-range: 6
+              merge-radius:
+                item: 4.0
+                exp: 6.0
+              entity-activation-range:
+                animals: 24
+                monsters: 32
+                raiders: 48
+                misc: 12
+                water: 12
+                villagers: 32
+                flying-monsters: 32
+              entity-tracking-range:
+                players: 48
+                animals: 48
+                monsters: 48
+                misc: 32
+                other: 64
+          '@
+          $bukkitYml = @'
+          # Written by the workflow on first start. Edit freely - your edits are persisted.
+          spawn-limits:
+            monsters: 70
+            animals: 10
+            water-animals: 5
+            water-ambient: 20
+            ambient: 5
+          chunk-gc:
+            period-in-ticks: 400
+          ticks-per:
+            autosave: 6000
+          '@
+          foreach ($cfg in @(@('paper.yml', $paperYml), @('spigot.yml', $spigotYml), @('bukkit.yml', $bukkitYml))) {
+            $p = Join-Path $dir $cfg[0]
+            if (-not (Test-Path $p)) { Set-Content -Path $p -Value $cfg[1] -Encoding utf8 }
+          }
+
+          Write-Host '=================== SERVER ==================='
+          Write-Host "Server       : Paper $($env:MC_VERSION) (build $build)"
+          Write-Host "World        : $(if ($restored) { 'RESTORED from the last backup' } else { 'NEW (no backup used)' })"
+          Write-Host "Max players  : $($env:MC_MAX_PLAYERS)   view/sim distance: $(Get-Prop $props 'view-distance')/$(Get-Prop $props 'simulation-distance')"
+          Write-Host "Online mode  : $(Get-Prop $props 'online-mode')"
+          Write-Host '=============================================='
+          $global:LASTEXITCODE = 0
+
+      - name: "8. Start Minecraft (headless, nogui)"
+        id: start
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . $env:MC_LIB
+          Start-McServer
+          Add-Content -Path $env:GITHUB_OUTPUT -Value 'started=true' -Encoding utf8
+          Wait-McReady -TimeoutSec 900
+          $summary = @(
+            '## Minecraft server is online',
+            '',
+            "- Minecraft address: ``$($env:TS_IP):$($env:MC_PORT)`` (or ``$($env:TS_DNS):$($env:MC_PORT)``)",
+            "- SSH: ``ssh $($env:SSH_USER)@$($env:TS_IP)``",
+            "- Heap: $($env:MC_HEAP_MB) MB, Paper $($env:MC_VERSION)",
+            "- Planned shutdown + backup: $($env:MC_STOP_AFTER_MIN) min after job start"
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8
+          Write-Host '=================== READY ==================='
+          Write-Host "Join with : $($env:TS_IP):$($env:MC_PORT)   or   $($env:TS_DNS):$($env:MC_PORT)"
+          Write-Host '============================================='
+          $global:LASTEXITCODE = 0
+
+      - name: "9. Keep alive (live backups, crash restarts, countdown)"
+        id: keepalive
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . $env:MC_LIB
+          $startAt = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:JOB_START_EPOCH)
+          $stopAt = $startAt.AddMinutes([int]$env:MC_STOP_AFTER_MIN)
+          $interval = [int]$env:MC_BACKUP_INTERVAL_MIN
+          $nextBackup = [DateTimeOffset]::UtcNow.AddMinutes($interval)
+          $nextBeat = [DateTimeOffset]::UtcNow.AddMinutes(5)
+          $logPath = Join-Path $env:MC_DIR 'logs\latest.log'
+          $logPos = [long]0
+          $restarts = 0
+          $announced = @{}
+          Write-Info "Keep-alive until $($stopAt.ToString('u')) (about $([math]::Round(($stopAt - [DateTimeOffset]::UtcNow).TotalMinutes)) min from now)."
+
+          while ($true) {
+            $now = [DateTimeOffset]::UtcNow
+            $left = ($stopAt - $now).TotalMinutes
+            if ($left -le 0) { break }
+
+            if (-not (Get-McProcess)) {
+              $restarts++
+              Write-Host "::error title=Minecraft crashed::The server process exited unexpectedly (crash #$restarts).`n$(Get-McLogTail)"
+              if ($restarts -gt 3) { throw 'Minecraft crashed more than 3 times - giving up so the final backup can run.' }
+              Start-Sleep -Seconds 15
+              Start-McServer
+              Wait-McReady -TimeoutSec 900
+              $logPos = [long]0
+              continue
+            }
+
+            foreach ($m in 10, 5, 1) {
+              if ($left -le $m -and -not $announced.ContainsKey($m)) {
+                $announced[$m] = $true
+                try { [void](Invoke-Rcon "say Server restarts for a backup in about $m minute(s). It will be back in a few minutes." -TimeoutSec 10) } catch { }
+              }
+            }
+
+            if ($now -ge $nextBackup -and $left -gt 30) {
+              try { New-McBackup -Mode live } catch { Write-Warn "Live backup failed (the final backup will still run): $($_.Exception.Message)" }
+              $nextBackup = [DateTimeOffset]::UtcNow.AddMinutes($interval)
+            }
+
+            Read-McLogDelta -Path $logPath -Position ([ref]$logPos)
+
+            if ($now -ge $nextBeat) {
+              Write-Info "Alive - $([math]::Round($left)) min until the planned shutdown."
+              $nextBeat = $now.AddMinutes(5)
+            }
+            Start-Sleep -Seconds 10
+          }
+          Read-McLogDelta -Path $logPath -Position ([ref]$logPos)
+          Write-Info 'Planned runtime reached - handing over to the shutdown/backup step.'
+          $global:LASTEXITCODE = 0
+
+      - name: "10. Graceful shutdown + final backup"
+        id: final
+        if: ${{ always() && steps.start.outputs.started == 'true' }}
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . $env:MC_LIB
+          try { [void](Invoke-Rcon 'say Shutting down now - saving the world.' -TimeoutSec 10) } catch { }
+          Stop-McServer
+          try {
+            New-McBackup -Mode stopped
+          } catch {
+            Write-Warn "Final backup failed once ($($_.Exception.Message)) - retrying in 20 seconds."
+            Start-Sleep -Seconds 20
+            New-McBackup -Mode stopped
+          }
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '### Final backup uploaded to the `mc-backup` release.' -Encoding utf8
+          $global:LASTEXITCODE = 0
+
+      - name: "11. Upload logs"
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: minecraft-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            C:\mc\server\logs
+            C:\mc\server\crash-reports
+            C:\mc\stdout.log
+            C:\mc\stderr.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: "12. Emergency copy of the backup if the release upload failed"
+        if: ${{ always() && steps.final.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: emergency-world-backup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: C:\mc\work\world-*
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: "13. Queue the next run"
+        if: ${{ success() && vars.MC_AUTOCHAIN != 'false' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $o = & gh workflow run minecraft-windows.yml --repo $env:GITHUB_REPOSITORY --ref $env:GITHUB_REF_NAME 2>&1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::Could not queue the next run: $o" } else { Write-Host 'Next run queued (it waits for this run to finish).' }
+          $global:LASTEXITCODE = 0
+
+      - name: "14. Tailscale logout"
+        if: ${{ always() }}
+        run: |
+          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (Test-Path $ts) { & $ts logout 2>&1 | Out-Host }
+          $global:LASTEXITCODE = 0
